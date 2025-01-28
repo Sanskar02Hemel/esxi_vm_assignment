@@ -4,6 +4,7 @@ import subprocess
 import signal
 import sys
 import time
+import re
 
 def execute_commands(command):
     try:
@@ -55,84 +56,143 @@ def manage_vm_power(vm_id, action):
         return {"error": error}
     return {"status": "Vm {} successfully.".format(action)}
 
-def create_snapshot(vm_id, snapshot_name):
-    start_time = time.time()
-    
-    command = "vim-cmd vmsvc/snapshot.create {} {} \"Snapshot created via API\" 0 0".format(vm_id, snapshot_name)
+def get_latest_snapshot_task(vm_id):
+    command = "vim-cmd vmsvc/get.tasklist {}".format(vm_id)
     output, error = execute_commands(command)
     
     if error:
-        return {"error": error}
-    
-    while True:
-        status_cmd = "vim-cmd vmsvc/get.snapshotinfo {}".format(vm_id)
-        status_output, status_error = execute_commands(status_cmd)
-        
-        if status_error:
-            return {"error": "Failed to check snapshot status: {}".format(status_error)}
-            
-        if "The virtual machine is busy" in status_output:
-            progress = {
-                "status": "In Progress",
-                "progress_percentage": 50,
-                "vm_id": vm_id
-            }
-            time.sleep(5)  
-            continue
-            
-        snapshot_cmd = "vim-cmd vmsvc/snapshot.get {}".format(vm_id)
-        output, error = execute_commands(snapshot_cmd)
-        
-        if error:
-            return {"error": "Failed to get snapshot details: {}".format(error)}
-            
-        snapshot_id = None
-        lines = output.splitlines()
-        for line in lines:
-            if "Snapshot Id" in line:
-                snapshot_id = line.split(':')[1].strip()
-        
-        end_time = time.time()
-        elapsed_time = round(end_time - start_time, 2)
-        
-        return {
-            "status": "Snapshot creation complete",
-            "vm_id": vm_id,
-            "snapshot_id": snapshot_id,
-            "snapshot_name": snapshot_name,
-            "time_taken_seconds": elapsed_time,
-            "progress_percentage": 100
-        }
+        return None
 
-def get_snapshot_progress(vm_id):
-    status_cmd = "vim-cmd vmsvc/get.snapshotinfo {}".format(vm_id)
-    status_output, status_error = execute_commands(status_cmd)
+    tasks = output.splitlines()
+    create_snapshot_tasks = [
+        task.strip("',") for task in tasks 
+        if 'createSnapshot' in task
+    ]
+
+    if not create_snapshot_tasks:
+        return None
+
+    latest_task = create_snapshot_tasks[-1]
     
-    if status_error:
-        return {"error": "Failed to check snapshot status: {}".format(status_error)}
-        
-    if "The virtual machine is busy" in status_output:
-        return {
-            "status": "In Progress",
-            "progress_percentage": 50,
-            "vm_id": vm_id
-        }
-    else:
-        snapshot_cmd = "vim-cmd vmsvc/snapshot.get {}".format(vm_id)
-        output, error = execute_commands(snapshot_cmd)
-        
-        if "Snapshot Id" in output:
+    task_match = re.search(r"haTask-\d+-vim\.VirtualMachine\.createSnapshot-\d+", latest_task)
+    if task_match:
+        return task_match.group(0)
+    return None
+
+def get_task_info(task_id):
+    command = "vim-cmd vimsvc/task_info '{}'".format(task_id)
+    output, error = execute_commands(command)
+    
+    if error:
+        return None
+
+    state = None
+    progress = 0
+    
+    for line in output.splitlines():
+        if 'state = "' in line:
+            state = line.split('"')[1]
+        elif 'progress = ' in line:
+            try:
+                progress = int(line.split('=')[1].strip(','))
+            except ValueError:
+                progress = 0
+
+    return {
+        'state': state,
+        'progress': progress
+    }
+
+def create_snapshot(vm_id, snapshot_name):
+    start_time = time.time()
+
+    command = "vim-cmd vmsvc/snapshot.create {} {} \"Snapshot created via API\" 0 0".format(vm_id, snapshot_name)
+    output, error = execute_commands(command)
+
+    if error:
+        return {"error": error}
+
+    while True:
+        task_id = get_latest_snapshot_task(vm_id)
+        if not task_id:
+            time.sleep(1)
+            continue
+
+        task_info = get_task_info(task_id)
+        if not task_info:
+            time.sleep(1)
+            continue
+
+        if task_info['state'] == 'success':
+            snapshot_cmd = "vim-cmd vmsvc/snapshot.get {}".format(vm_id)
+            output, error = execute_commands(snapshot_cmd)
+            snapshot_id = None
+
+            if not error:
+                lines = output.splitlines()
+                for line in lines:
+                    if "Snapshot Id" in line:
+                        snapshot_id = line.split(':')[1].strip()
+            
+            end_time = time.time()
+            elapsed_time = round(end_time - start_time, 2)
+            elapsed_time_str = "{:.2f}".format(elapsed_time)
+
             return {
-                "status": "Complete",
-                "progress_percentage": 100,
+                "status": "Snapshot creation complete",
+                "vm_id": vm_id,
+                "snapshot_id": snapshot_id,
+                "snapshot_name": snapshot_name,
+                "time_taken_seconds": elapsed_time_str,
+                "progress_percentage": task_info['progress']
+            }
+        elif task_info['state'] == 'error':
+            return {
+                "error": "Snapshot creation failed",
                 "vm_id": vm_id
             }
         else:
-            return {
-                "status": "No snapshot operation in progress",
-                "progress_percentage": 0,
+            progress = {
+                "status": "In Progress",
+                "progress_percentage": task_info['progress'],
                 "vm_id": vm_id
             }
+            time.sleep(2)
+
+def get_snapshot_progress(vm_id):
+    task_id = get_latest_snapshot_task(vm_id)
+    if not task_id:
+        return {
+            "status": "No snapshot operation in progress",
+            "progress_percentage": 0,
+            "vm_id": vm_id
+        }
+        
+    task_info = get_task_info(task_id)
+    if not task_info:
+        return {
+            "error": "Failed to get task information",
+            "vm_id": vm_id
+        }
+        
+    if task_info['state'] == 'success':
+        return {
+            "status": "Complete",
+            "progress_percentage": task_info['progress'],
+            "vm_id": vm_id
+        }
+    elif task_info['state'] == 'error':
+        return {
+            "status": "Failed",
+            "progress_percentage": task_info['progress'],
+            "vm_id": vm_id
+        }
+    else:
+        return {
+            "status": "In Progress",
+            "progress_percentage": task_info['progress'],
+            "vm_id": vm_id
+        }
 
 def get_vm_count():
     result = get_all_vms()
