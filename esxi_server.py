@@ -5,6 +5,35 @@ import signal
 import sys
 import time
 import re
+import threading
+from datetime import datetime
+class ClientHandler(threading.Thread):
+    def __init__(self, client_socket, client_address):
+        threading.Thread.__init__(self)
+        self.client_socket = client_socket
+        self.client_address = client_address
+
+    def run(self):
+        try:
+            data = self.client_socket.recv(1024)
+            if not data:
+                print("No data received, closing connection")
+                self.client_socket.close()
+                return
+
+            print("Raw data received: {}".format(data))
+            try:
+                command = json.loads(data.decode('utf-8'))
+                print("Decoded command: {}".format(command))
+                response = handle_vm_operations(command)
+                self.client_socket.send(json.dumps(response).encode())
+                print("Sent response: {}".format(response))
+            except json.JSONDecodeError as e:
+                response = {"error": "Invalid JSON: {0}".format(str(e))}
+                self.client_socket.send(json.dumps(response).encode())
+                print("Sent error response: {}".format(response))
+        finally:
+            self.client_socket.close()
 
 def execute_commands(command):
     try:
@@ -72,46 +101,50 @@ def get_latest_snapshot_task(vm_id):
     if not create_snapshot_tasks:
         return None
 
-    latest_task = create_snapshot_tasks[-1]
-    
+    latest_task = create_snapshot_tasks[0]
     task_match = re.search(r"haTask-\d+-vim\.VirtualMachine\.createSnapshot-\d+", latest_task)
-    if task_match:
-        return task_match.group(0)
-    return None
+    return task_match.group(0) if task_match else None
 
 def get_task_info(task_id):
-    command = "vim-cmd vimsvc/task_info '{}'".format(task_id)
+    command = "vim-cmd vimsvc/task_info '{0}'".format(task_id)
     output, error = execute_commands(command)
     
     if error:
         return None
 
-    state = None
-    progress = 0
-    
-    for line in output.splitlines():
-        if 'state = "' in line:
-            state = line.split('"')[1]
-        elif 'progress = ' in line:
-            try:
-                progress = int(line.split('=')[1].strip(','))
-            except ValueError:
-                progress = 0
-
-    return {
-        'state': state,
-        'progress': progress
+    task_info = {
+        'state': 'unknown',
+        'progress': 0,
+        'start_time': None,
+        'complete_time': None
     }
 
-def create_snapshot(vm_id, snapshot_name):
-    start_time = time.time()
+    if output:
+        for line in output.splitlines():
+            if 'state = "' in line:
+                task_info['state'] = line.split('"')[1]
+            elif 'progress = ' in line:
+                progress_str = line.split('=')[1].strip(' ,')
+                task_info['progress'] = int(progress_str) if progress_str.isdigit() else 0
+            elif 'startTime = "' in line:
+                task_info['start_time'] = line.split('"')[1]
+            elif 'completeTime = "' in line:
+                task_info['complete_time'] = line.split('"')[1]
 
-    command = "vim-cmd vmsvc/snapshot.create {} {} \"Snapshot created via API\" 0 0".format(vm_id, snapshot_name)
+    return task_info
+
+def create_snapshot(vm_id, snapshot_name, description="Snapshot created via API"):
+    command = 'vim-cmd vmsvc/snapshot.create {0} "{1}" "{2}" 1 0'.format(
+        vm_id, snapshot_name, description
+    )
     output, error = execute_commands(command)
 
     if error:
         return {"error": error}
 
+    time.sleep(1)
+
+    start_time = time.time()
     while True:
         task_id = get_latest_snapshot_task(vm_id)
         if not task_id:
@@ -124,40 +157,31 @@ def create_snapshot(vm_id, snapshot_name):
             continue
 
         if task_info['state'] == 'success':
-            snapshot_cmd = "vim-cmd vmsvc/snapshot.get {}".format(vm_id)
-            output, error = execute_commands(snapshot_cmd)
-            snapshot_id = None
-
-            if not error:
-                lines = output.splitlines()
-                for line in lines:
-                    if "Snapshot Id" in line:
-                        snapshot_id = line.split(':')[1].strip()
-            
             end_time = time.time()
-            elapsed_time = round(end_time - start_time, 2)
-            elapsed_time_str = "{:.2f}".format(elapsed_time)
+            elapsed_time = end_time - start_time
+
+            if task_info['start_time'] and task_info['complete_time']:
+                try:
+                    start = datetime.strptime(task_info['start_time'], "%Y-%m-%dT%H:%M:%S.%fZ")
+                    complete = datetime.strptime(task_info['complete_time'], "%Y-%m-%dT%H:%M:%S.%fZ")
+                    elapsed_time = (complete - start).total_seconds()
+                except ValueError:
+                    pass  
 
             return {
                 "status": "Snapshot creation complete",
                 "vm_id": vm_id,
-                "snapshot_id": snapshot_id,
                 "snapshot_name": snapshot_name,
-                "time_taken_seconds": elapsed_time_str,
-                "progress_percentage": task_info['progress']
+                "time_taken_seconds": elapsed_time
             }
         elif task_info['state'] == 'error':
             return {
-                "error": "Snapshot creation failed",
-                "vm_id": vm_id
+                "status": "Error creating snapshot",
+                "vm_id": vm_id,
+                "error": "Task failed"
             }
-        else:
-            progress = {
-                "status": "In Progress",
-                "progress_percentage": task_info['progress'],
-                "vm_id": vm_id
-            }
-            time.sleep(2)
+
+        time.sleep(1)
 
 def get_snapshot_progress(vm_id):
     task_id = get_latest_snapshot_task(vm_id)
@@ -167,32 +191,44 @@ def get_snapshot_progress(vm_id):
             "progress_percentage": 0,
             "vm_id": vm_id
         }
-        
+
     task_info = get_task_info(task_id)
     if not task_info:
         return {
             "error": "Failed to get task information",
             "vm_id": vm_id
         }
-        
+
+    response = {
+        "vm_id": vm_id,
+        "progress_percentage": task_info['progress'],
+        "state": task_info['state']
+    }
+
     if task_info['state'] == 'success':
-        return {
+        elapsed_time = None
+        if task_info['start_time'] and task_info['complete_time']:
+            try:
+                start = datetime.strptime(task_info['start_time'], "%Y-%m-%dT%H:%M:%S.%fZ")
+                complete = datetime.strptime(task_info['complete_time'], "%Y-%m-%dT%H:%M:%S.%fZ")
+                elapsed_time = (complete - start).total_seconds()
+            except ValueError:
+                elapsed_time = None
+
+        response.update({
             "status": "Complete",
-            "progress_percentage": task_info['progress'],
-            "vm_id": vm_id
-        }
-    elif task_info['state'] == 'error':
-        return {
-            "status": "Failed",
-            "progress_percentage": task_info['progress'],
-            "vm_id": vm_id
-        }
+            "time_taken_seconds": elapsed_time
+        })
+    elif task_info['state'] == 'running':
+        response.update({
+            "status": "In Progress"
+        })
     else:
-        return {
-            "status": "In Progress",
-            "progress_percentage": task_info['progress'],
-            "vm_id": vm_id
-        }
+        response.update({
+            "status": task_info['state']
+        })
+
+    return response
 
 def get_vm_count():
     result = get_all_vms()
@@ -242,6 +278,7 @@ def handle_vm_operations(command):
     vm_id = command.get("vm_id")
     snapshot_name = command.get("snapshot_name", "Snapshot")
     snapshot_id = command.get("snapshot_id")
+    description = command.get("description", "Snapshot created via API")
 
     if action == "list_vms":
         return get_all_vms()
@@ -253,8 +290,8 @@ def handle_vm_operations(command):
         return manage_vm_power(vm_id, "power_off")
     elif action == "reboot":
         return manage_vm_power(vm_id, "reboot")
-    elif action == "create_snapshot":
-        return create_snapshot(vm_id, snapshot_name)
+    if action == "create_snapshot":
+        return create_snapshot(vm_id, snapshot_name, description)
     elif action == "get_snapshot_progress":
         return get_snapshot_progress(vm_id)
     elif action == "revert_snapshot":
@@ -274,11 +311,11 @@ def tcp_server(server_address):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(server_address)
-    server.listen(2)
+    server.listen(5) 
     print("TCP server running on {}".format(server_address))
 
-    signal.signal(signal.SIGINT, signal_handler)  
-    signal.signal(signal.SIGTERM, signal_handler) 
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     try:
         while True:
@@ -286,32 +323,9 @@ def tcp_server(server_address):
             client_socket, client_address = server.accept()
             print("Connection established with {}".format(client_address))
 
-            data = client_socket.recv(1024)
-            if not data:
-                print("No data received, closing connection")
-                client_socket.close()
-                continue
-
-            print("Raw data received: {}".format(data))
-            try:
-                command = json.loads(data.decode('utf-8'))
-                print("Decoded command: {}".format(command))
-            except json.JSONDecodeError as e:
-                response = {"error": "Invalid JSON: {}".format(str(e))}
-                client_socket.send(json.dumps(response).encode())
-                print("Sent error response: {}".format(response))
-                client_socket.close()
-                continue
-
-            response = handle_vm_operations(command)
-
-            if response.get("status") == "Server shutting down":
-                client_socket.send(json.dumps(response).encode())
-                client_socket.close()
-                break
-
-            client_socket.send(json.dumps(response).encode())
-            client_socket.close()
+            client_handler = ClientHandler(client_socket, client_address)
+            client_handler.daemon = True
+            client_handler.start()
 
     except KeyboardInterrupt:
         print("Shutting down server...")
